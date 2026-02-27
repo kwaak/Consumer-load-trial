@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Configuration;
 using StackExchange.Redis;
 using ConsumerLoadTrial;
+using StreamConsumer = ConsumerLoadTrial.StreamConsumer;
 
 // === Configuratie laden ===
 var config = new ConfigurationBuilder()
