@@ -23,3 +23,6 @@ project.fragment.lock.json
 .idea/
 *.swp
 *~
+
+## Redis
+dump.rdb
