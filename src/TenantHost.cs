@@ -15,8 +15,11 @@ public class TenantHost
     private readonly List<StreamConsumer> _consumers = new();
     private readonly List<Task> _tasks = new();
 
+    private System.Diagnostics.Stopwatch? _stopwatch;
+
     public Tenant Tenant => _tenant;
     public int TotalProcessed => _consumers.Sum(c => c.ProcessedCount);
+    public TimeSpan Elapsed => _stopwatch?.Elapsed ?? TimeSpan.Zero;
 
     public TenantHost(IDatabase db, Tenant tenant, int processingDelayMs)
     {
@@ -47,6 +50,7 @@ public class TenantHost
 
     public void StartConsumers(CancellationToken ct)
     {
+        _stopwatch = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 1; i <= _tenant.MaxConsumers; i++)
         {
             var consumer = new StreamConsumer(
@@ -61,19 +65,12 @@ public class TenantHost
     {
         while (TotalProcessed < expectedCount)
             await Task.Delay(100);
+        _stopwatch?.Stop();
     }
 
     public async Task StopAsync(CancellationTokenSource cts)
     {
         cts.Cancel();
         await Task.WhenAll(_tasks);
-    }
-
-    public void PrintStats(int expectedCount)
-    {
-        Console.WriteLine($"  Klant {_tenant.Id}: {TotalProcessed}/{expectedCount} verwerkt " +
-                          $"({_tenant.MaxConsumers} consumers, max {_tenant.MaxConsumers} tegelijk)");
-        foreach (var c in _consumers)
-            Console.WriteLine($"    {c.Name}: {c.ProcessedCount} berichten");
     }
 }
