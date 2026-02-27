@@ -2,10 +2,6 @@ using StackExchange.Redis;
 
 namespace ConsumerLoadTrial;
 
-/// <summary>
-/// Een consumer die berichten leest uit een Redis Stream consumer group.
-/// Meerdere instanties verdelen de load automatisch.
-/// </summary>
 public class StreamConsumer
 {
     private readonly IDatabase _db;
@@ -27,56 +23,40 @@ public class StreamConsumer
         _processingDelayMs = processingDelayMs;
     }
 
-    public async Task ConsumeAsync(CancellationToken ct)
+    public async Task RunAsync(CancellationToken ct)
     {
-        Console.WriteLine($"[{_consumerName}] Gestart, wacht op berichten...");
-
         while (!ct.IsCancellationRequested)
         {
             try
             {
                 var entries = await _db.StreamReadGroupAsync(
-                    _streamKey,
-                    _groupName,
-                    _consumerName,
-                    ">",       // Alleen nieuwe berichten
-                    count: 1
-                );
+                    _streamKey, _groupName, _consumerName,
+                    ">", count: 1);
 
                 if (entries.Length == 0)
                 {
-                    // Geen nieuwe berichten, kort wachten
-                    await Task.Delay(100, ct);
+                    await Task.Delay(50, ct);
                     continue;
                 }
 
                 foreach (var entry in entries)
                 {
                     var orderId = entry.Values.FirstOrDefault(v => v.Name == "orderId").Value;
-                    var product = entry.Values.FirstOrDefault(v => v.Name == "product").Value;
-                    var quantity = entry.Values.FirstOrDefault(v => v.Name == "quantity").Value;
-
-                    Console.WriteLine($"[{_consumerName}] Verwerkt: {orderId} | {product} x{quantity}");
+                    Console.WriteLine($"  [{_consumerName}] Verwerkt: {orderId}");
 
                     // Simuleer verwerkingstijd
                     await Task.Delay(_processingDelayMs, ct);
 
-                    // Bevestig dat het bericht verwerkt is
                     await _db.StreamAcknowledgeAsync(_streamKey, _groupName, entry.Id);
                     Interlocked.Increment(ref _processedCount);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                Console.WriteLine($"[{_consumerName}] Fout: {ex.Message}");
+                Console.WriteLine($"  [{_consumerName}] Fout: {ex.Message}");
                 await Task.Delay(1000, ct);
             }
         }
-
-        Console.WriteLine($"[{_consumerName}] Gestopt. Totaal verwerkt: {_processedCount}");
     }
 }

@@ -1,117 +1,88 @@
 using Microsoft.Extensions.Configuration;
 using StackExchange.Redis;
 using ConsumerLoadTrial;
-using StreamConsumer = ConsumerLoadTrial.StreamConsumer;
 
-// === Configuratie laden ===
 var config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json")
     .Build();
 
-var redisConnectionString = config["Redis:ConnectionString"] ?? "localhost:6379";
-var streamKey = config["Redis:StreamKey"] ?? "orders-stream";
-var groupName = config["Redis:ConsumerGroup"] ?? "order-processors";
-var messageCount = int.Parse(config["Redis:MessageCount"] ?? "50");
-var consumerCount = int.Parse(config["Redis:ConsumerCount"] ?? "3");
-var processingDelayMs = int.Parse(config["Redis:ProcessingDelayMs"] ?? "200");
+var redisConn = config["Redis:ConnectionString"] ?? "localhost:6379";
+var tenantCount = int.Parse(config["Tenants:Count"] ?? "10");
+var consumersPerTenant = int.Parse(config["Tenants:DefaultConsumersPerTenant"] ?? "2");
+var messagesPerTenant = int.Parse(config["Tenants:MessagesPerTenant"] ?? "10");
+var delayMs = int.Parse(config["Tenants:ProcessingDelayMs"] ?? "500");
 
-Console.WriteLine("=== Consumer Load Trial - Redis Streams ===");
-Console.WriteLine($"Redis:          {redisConnectionString}");
-Console.WriteLine($"Stream:         {streamKey}");
-Console.WriteLine($"Consumer Group: {groupName}");
-Console.WriteLine($"Berichten:      {messageCount}");
-Console.WriteLine($"Consumers:      {consumerCount}");
-Console.WriteLine($"Vertraging:     {processingDelayMs}ms per bericht");
-Console.WriteLine("============================================\n");
+Console.WriteLine("=== Consumer Load Trial - Multi-Tenant ===");
+Console.WriteLine($"Klanten:                {tenantCount}");
+Console.WriteLine($"Consumers per klant:    {consumersPerTenant} (= max {consumersPerTenant} tegelijk)");
+Console.WriteLine($"Berichten per klant:    {messagesPerTenant}");
+Console.WriteLine($"Verwerkingstijd:        {delayMs}ms per bericht");
+Console.WriteLine($"Totaal berichten:       {tenantCount * messagesPerTenant}");
+Console.WriteLine("==========================================\n");
 
-// === Verbinden met Redis ===
-Console.WriteLine("Verbinden met Redis...");
-var redis = await ConnectionMultiplexer.ConnectAsync(redisConnectionString);
+// === Verbinden ===
+var redis = await ConnectionMultiplexer.ConnectAsync(redisConn);
 var db = redis.GetDatabase();
-Console.WriteLine("Verbonden!\n");
 
-// === Stream opschonen en consumer group aanmaken ===
-// Verwijder oude stream als die bestaat (schone test)
-await db.KeyDeleteAsync(streamKey);
+// === Tenants aanmaken ===
+var tenants = Enumerable.Range(1, tenantCount)
+    .Select(i => new Tenant($"klant-{i:D2}", consumersPerTenant))
+    .ToList();
 
-// Maak de consumer group aan (MKSTREAM maakt de stream automatisch)
-await db.StreamCreateConsumerGroupAsync(streamKey, groupName, "0-0", createStream: true);
-Console.WriteLine($"Consumer group '{groupName}' aangemaakt op stream '{streamKey}'.\n");
+// Voorbeeld: klant-01 heeft betaald voor extra capaciteit (4 consumers)
+// Uncomment de volgende regel om opschalen te testen:
+// tenants[0].MaxConsumers = 4;
 
-// === Produceer berichten ===
-var producer = new StreamProducer(db, streamKey);
-await producer.ProduceMessagesAsync(messageCount);
-Console.WriteLine();
+var hosts = tenants.Select(t => new TenantHost(db, t, delayMs)).ToList();
 
-// === Start consumers ===
-using var cts = new CancellationTokenSource();
-var consumers = new List<StreamConsumer>();
-var consumerTasks = new List<Task>();
-
-for (int i = 1; i <= consumerCount; i++)
+// === Setup streams en produceer berichten ===
+Console.WriteLine("[Setup] Streams aanmaken en berichten publiceren...");
+foreach (var host in hosts)
 {
-    var consumer = new StreamConsumer(db, streamKey, groupName, $"consumer-{i}", processingDelayMs);
-    consumers.Add(consumer);
-    consumerTasks.Add(consumer.ConsumeAsync(cts.Token));
+    await host.SetupAsync();
+    await host.ProduceAsync(messagesPerTenant);
 }
+Console.WriteLine($"[Setup] {tenantCount * messagesPerTenant} berichten gepubliceerd over {tenantCount} klanten.\n");
 
-// === Wacht tot alle berichten verwerkt zijn ===
-Console.WriteLine($"\nWachten tot alle {messageCount} berichten verwerkt zijn...\n");
-
-while (consumers.Sum(c => c.ProcessedCount) < messageCount)
+// === Start alle consumers ===
+Console.WriteLine("[Start] Consumers starten...");
+var ctsList = new List<CancellationTokenSource>();
+foreach (var host in hosts)
 {
-    await Task.Delay(500);
+    var cts = new CancellationTokenSource();
+    ctsList.Add(cts);
+    host.StartConsumers(cts.Token);
 }
+Console.WriteLine($"[Start] {tenantCount * consumersPerTenant} consumers actief.\n");
 
-// Stop alle consumers
-cts.Cancel();
-await Task.WhenAll(consumerTasks);
+// === Wacht tot alles verwerkt is ===
+var sw = System.Diagnostics.Stopwatch.StartNew();
+await Task.WhenAll(hosts.Select(h => h.WaitForCompletionAsync(messagesPerTenant)));
+sw.Stop();
 
-// === Resultaten tonen ===
+// === Stop consumers ===
+for (int i = 0; i < hosts.Count; i++)
+    await hosts[i].StopAsync(ctsList[i]);
+
+// === Resultaten ===
 Console.WriteLine("\n=== RESULTATEN ===");
-Console.WriteLine($"{"Consumer",-15} {"Verwerkt",10} {"Percentage",12}");
-Console.WriteLine(new string('-', 37));
+Console.WriteLine($"Totale verwerkingstijd: {sw.Elapsed.TotalSeconds:F1}s\n");
 
-foreach (var consumer in consumers)
-{
-    var pct = (double)consumer.ProcessedCount / messageCount * 100;
-    Console.WriteLine($"{consumer.Name,-15} {consumer.ProcessedCount,10} {pct,11:F1}%");
-}
+foreach (var host in hosts)
+    host.PrintStats(messagesPerTenant);
 
-Console.WriteLine(new string('-', 37));
-Console.WriteLine($"{"Totaal",-15} {consumers.Sum(c => c.ProcessedCount),10} {"100.0%",11}");
-Console.WriteLine();
+// === Theoretische tijden ===
+Console.WriteLine("\n=== ANALYSE ===");
+var theoreticalPerTenant = Math.Ceiling((double)messagesPerTenant / consumersPerTenant) * delayMs / 1000.0;
+Console.WriteLine($"Theoretisch per klant ({messagesPerTenant} berichten / {consumersPerTenant} consumers): {theoreticalPerTenant:F1}s");
+Console.WriteLine($"Werkelijke tijd: {sw.Elapsed.TotalSeconds:F1}s");
+Console.WriteLine($"Alle klanten draaien parallel, dus totale tijd ≈ tijd per klant.");
 
-// === Gelijkmatigheid berekenen ===
-var counts = consumers.Select(c => (double)c.ProcessedCount).ToList();
-var avg = counts.Average();
-var stddev = Math.Sqrt(counts.Sum(c => Math.Pow(c - avg, 2)) / counts.Count);
-var cv = avg > 0 ? stddev / avg * 100 : 0;
-
-Console.WriteLine($"Gemiddeld per consumer: {avg:F1}");
-Console.WriteLine($"Standaardafwijking:     {stddev:F1}");
-Console.WriteLine($"Variatiecoëfficiënt:    {cv:F1}% (lager = gelijkmatiger)");
-
-if (cv < 10)
-    Console.WriteLine("-> Uitstekende load verdeling!");
-else if (cv < 25)
-    Console.WriteLine("-> Redelijke load verdeling.");
-else
-    Console.WriteLine("-> Ongelijke load verdeling - overweeg tuning.");
-
-// === Stream info tonen ===
-var streamInfo = await db.StreamInfoAsync(streamKey);
-var groupInfo = await db.StreamGroupInfoAsync(streamKey);
-
-Console.WriteLine($"\n=== STREAM INFO ===");
-Console.WriteLine($"Stream lengte:    {streamInfo.Length}");
-Console.WriteLine($"Consumer groups:  {groupInfo.Length}");
-
-foreach (var g in groupInfo)
-{
-    Console.WriteLine($"  Group '{g.Name}': {g.ConsumerCount} consumers, {g.PendingMessageCount} pending");
-}
+Console.WriteLine("\n=== OPSCHALEN ===");
+Console.WriteLine($"Huidige capaciteit per klant: {consumersPerTenant} berichten tegelijk");
+Console.WriteLine("Wil een klant sneller? Verhoog MaxConsumers in de config of per tenant.");
+Console.WriteLine("Voorbeeld: klant met 4 consumers verwerkt 2x zo snel als met 2.");
 
 Console.WriteLine("\nKlaar!");
 redis.Dispose();
