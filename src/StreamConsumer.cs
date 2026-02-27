@@ -10,9 +10,12 @@ public class StreamConsumer
     private readonly string _consumerName;
     private readonly int _processingDelayMs;
     private int _processedCount;
+    private volatile bool _draining;
 
     public int ProcessedCount => _processedCount;
     public string Name => _consumerName;
+    public bool IsDraining => _draining;
+    public bool IsStopped { get; private set; }
 
     public StreamConsumer(IDatabase db, string streamKey, string groupName, string consumerName, int processingDelayMs)
     {
@@ -23,10 +26,26 @@ public class StreamConsumer
         _processingDelayMs = processingDelayMs;
     }
 
+    /// <summary>
+    /// Start drain: verwerk het huidige bericht af, maar pak geen nieuwe op.
+    /// </summary>
+    public void Drain()
+    {
+        _draining = true;
+    }
+
     public async Task RunAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
+            // Als we aan het drainen zijn, stop met nieuwe berichten ophalen
+            if (_draining)
+            {
+                IsStopped = true;
+                Console.WriteLine($"  [{_consumerName}] Drain voltooid - gestopt.");
+                return;
+            }
+
             try
             {
                 var entries = await _db.StreamReadGroupAsync(
@@ -42,10 +61,23 @@ public class StreamConsumer
                 foreach (var entry in entries)
                 {
                     var orderId = entry.Values.FirstOrDefault(v => v.Name == "orderId").Value;
-                    Console.WriteLine($"  [{_consumerName}] Verwerkt: {orderId}");
+                    var executionCode = entry.Values.FirstOrDefault(v => v.Name == "executionCode").Value;
+                    var nodesRaw = entry.Values.FirstOrDefault(v => v.Name == "nodes").Value;
+                    var nodes = nodesRaw.ToString().Split(',');
 
-                    // Simuleer verwerkingstijd
-                    await Task.Delay(_processingDelayMs, ct);
+                    var delayPerNode = _processingDelayMs / nodes.Length;
+
+                    Console.WriteLine($"  [{_consumerName}] Start: {orderId} (exec: {executionCode}, {nodes.Length} nodes)");
+
+                    // Verwerk elke node afzonderlijk
+                    foreach (var node in nodes)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        Console.WriteLine($"    [{_consumerName}]   → Node {node} verwerken ({delayPerNode}ms)");
+                        await Task.Delay(delayPerNode, ct);
+                    }
+
+                    Console.WriteLine($"  [{_consumerName}] Klaar: {orderId}");
 
                     await _db.StreamAcknowledgeAsync(_streamKey, _groupName, entry.Id);
                     Interlocked.Increment(ref _processedCount);
@@ -58,5 +90,7 @@ public class StreamConsumer
                 await Task.Delay(1000, ct);
             }
         }
+
+        IsStopped = true;
     }
 }
